@@ -3,6 +3,7 @@ package orders
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -29,14 +30,16 @@ type pagedRuntime struct {
 	pages []RefreshSoldPage
 	// failAfter 为非 nil 时，在提交完全部 pages 后返回该错误，模拟中途失败或取消。
 	failAfter error
+	// truncated 表示本次分页读取因达到最近订单条数上限而提前结束；未拉取的更早订单保留在本地。
+	truncated bool
 	// betweenPages 在每页提交成功后被调用，index 为刚提交页的下标，用于模拟页间的外部变化。
 	betweenPages func(index int)
 }
 
 // FetchSoldOrdersPaged 按脚本逐页调用 handler；handler 报错立即终止。
 func (r *pagedRuntime) FetchSoldOrdersPaged(ctx context.Context, _ *PlatformRuntimeData, handler RefreshSoldPageHandler) (RefreshSoldFetchResult, error) {
-	// final 与真实运行时一致，携带最后一页的累计 Cookie 状态。
-	final := RefreshSoldFetchResult{}
+	// final 与真实运行时一致，携带最后一页的累计 Cookie 状态；截断标记随最终状态返回，调用方据此跳过缺失清理。
+	final := RefreshSoldFetchResult{Truncated: r.truncated}
 	// index、page 是当前提交的页下标和内容。
 	for index, page := range r.pages {
 		final.CookieUpdate = page.CookieUpdate
@@ -128,6 +131,47 @@ func TestPagedDiscoveryCancellationKeepsPriorPages(t *testing.T) {
 	discovered, _, _, err := service.discoverAccount(ctx, 7, "cookie-1")
 	if !errors.Is(err, context.Canceled) || discovered != 1 || repository.deleteCalls != 0 || repository.orders["o2"] != nil {
 		t.Fatalf("取消应保留第一页并跳过清理: discovered=%d err=%v deletes=%d orders=%v", discovered, err, repository.deleteCalls, repository.orders)
+	}
+}
+
+// TestPagedDiscoveryTruncatedSkipsCleanupButKeepsOrders 验证截断的增量同步保留已提交订单且不清理缺失订单，提示说明仅同步最近订单。
+func TestPagedDiscoveryTruncatedSkipsCleanupButKeepsOrders(t *testing.T) {
+	// service、repository、runtime 是被测刷新服务、内存仓储和标记截断的脚本化运行时。
+	service, repository, runtime := newPagedFixture(pageOf("o1", "o2"), pageOf("o3"))
+	runtime.truncated = true
+	repository.soldDeleteCount = 4
+	// result、err 保存截断刷新结果。
+	result, err := service.Refresh(context.Background(), 7, "cookie-1", "")
+	if err != nil || result.PartialFailure || result.Summary.Discovered != 3 || result.Summary.SoftDeleted != 0 || !result.Summary.Truncated {
+		t.Fatalf("截断刷新结果异常: result=%+v err=%v", result, err)
+	}
+	if repository.deleteCalls != 0 || repository.orders["o1"] == nil || repository.orders["o2"] == nil || repository.orders["o3"] == nil {
+		t.Fatalf("截断时已提交订单必须保留且禁止缺失清理: deletes=%d orders=%v", repository.deleteCalls, repository.orders)
+	}
+	if !strings.Contains(result.Message, "最近 100 条") {
+		t.Fatalf("截断时提示应说明仅同步最近订单: %q", result.Message)
+	}
+}
+
+// TestPagedDiscoveryFallbackPropagatesTruncated 验证不实现分页能力的运行时经一次性读取回退时，截断标记同样透传并跳过缺失清理。
+func TestPagedDiscoveryFallbackPropagatesTruncated(t *testing.T) {
+	// repository 是带清理记录的内存仓储。
+	repository := &pagedRepository{refreshRepositoryFake: &refreshRepositoryFake{owned: map[string]bool{"cookie-1": true}, detail: &PlatformRuntimeData{ID: "cookie-1", UserID: 7, Value: "cookie"}}}
+	repository.soldDeleteCount = 4
+	// runtime 是不实现分页读取的一次性运行时，预置截断的订单列表结果。
+	runtime := &refreshRuntimeFake{soldAvailable: true, soldResult: RefreshSoldFetchResult{Orders: []RefreshSoldOrder{{OrderID: "o1", OrderStatus: "pending_ship"}, {OrderID: "o2", OrderStatus: "pending_ship"}}, Truncated: true}}
+	// service 使用一次性运行时，fetchSoldPaged 应走回退路径。
+	service := NewRefreshService(repository, runtime, 1)
+	// result、err 保存回退路径的刷新结果。
+	result, err := service.Refresh(context.Background(), 7, "cookie-1", "")
+	if err != nil || result.PartialFailure || result.Summary.Discovered != 2 || result.Summary.SoftDeleted != 0 || !result.Summary.Truncated {
+		t.Fatalf("回退路径截断结果异常: result=%+v err=%v", result, err)
+	}
+	if repository.deleteCalls != 0 || repository.orders["o1"] == nil || repository.orders["o2"] == nil {
+		t.Fatalf("回退截断时已提交订单必须保留且禁止缺失清理: deletes=%d orders=%v", repository.deleteCalls, repository.orders)
+	}
+	if !strings.Contains(result.Message, "最近 100 条") {
+		t.Fatalf("回退截断时提示应说明仅同步最近订单: %q", result.Message)
 	}
 }
 

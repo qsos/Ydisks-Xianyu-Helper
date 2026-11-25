@@ -231,6 +231,15 @@ func TestFinishOrderRefreshNeverLabelsFailureAsSuccess(t *testing.T) {
 	}
 }
 
+// TestFinishOrderRefreshNotesTruncatedSync 验证截断的同步在提示中说明仅同步最近订单。
+func TestFinishOrderRefreshNotesTruncatedSync(t *testing.T) {
+	// result 保存截断同步的任务摘要。
+	result := finishOrderRefresh(RefreshSummary{Truncated: true}, nil, "订单列表同步完成")
+	if result.PartialFailure || !strings.Contains(result.Message, "最近 100 条") {
+		t.Fatalf("截断提示应说明仅同步最近订单: %+v", result)
+	}
+}
+
 // TestSoldRecoveryOptionsKeepsPlatformFields 验证平台砍价、地址与时间字段进入恢复选项，旧会话及发货标记不会被伪造。
 func TestSoldRecoveryOptionsKeepsPlatformFields(t *testing.T) {
 	// options 是平台完整订单转换结果，收货数据仅为本地虚构夹具。

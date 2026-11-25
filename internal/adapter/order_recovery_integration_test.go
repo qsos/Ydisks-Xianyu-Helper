@@ -25,7 +25,7 @@ type orderRecoveryPlatform struct {
 // FetchSoldOrdersPage 使用 f 的本地页替身响应 ctx、cookies、pageNumber、pageSize；身份不符时终止测试，返回值不访问外网。
 func (f *orderRecoveryPlatform) FetchSoldOrdersPage(ctx context.Context, cookies string, pageNumber, pageSize int) (*mtop.SoldOrdersPage, error) {
 	f.t.Helper()
-	if !strings.Contains(cookies, "unb=1") || pageSize != 30 {
+	if !strings.Contains(cookies, "unb=1") || pageSize != 100 {
 		f.t.Fatal("已售请求必须使用卖家身份及生产分页大小")
 	}
 	f.pages = append(f.pages, pageNumber)

@@ -118,3 +118,78 @@ func TestOrderRuntimeAdapterForwardsPagedFetch(t *testing.T) {
 		t.Fatal("运行时未初始化必须返回错误")
 	}
 }
+
+// newCappedPagedRuntime 构造按 ordersPerPage 返回订单的分页运行时，平台侧共 totalOrders 条订单；calls 与 gotPageSize 由调用方提供，用于核对请求次数与每页条数。
+func newCappedPagedRuntime(totalOrders, ordersPerPage int, calls, gotPageSize *int) *OrderRuntime {
+	// fake 的 fetch 回调按页码切片返回订单，NextPage 表示是否还有后续页。
+	fake := &soldRuntimePageFake{orderRuntimeMTopFake: &orderRuntimeMTopFake{}, fetch: func(_ context.Context, _ string, pageNumber, pageSize int) (*mtop.SoldOrdersPage, error) {
+		*calls++
+		*gotPageSize = pageSize
+		// start 是本页第一条订单在全部订单中的下标。
+		start := (pageNumber - 1) * ordersPerPage
+		if start >= totalOrders {
+			return &mtop.SoldOrdersPage{}, nil
+		}
+		// end 是本页最后一条订单的下标（不含），不超过订单总数。
+		end := start + ordersPerPage
+		if end > totalOrders {
+			end = totalOrders
+		}
+		// items 保存本页订单。
+		items := make([]mtop.SoldOrder, 0, end-start)
+		// i 是订单序号。
+		for i := start; i < end; i++ {
+			items = append(items, mtop.SoldOrder{OrderID: fmt.Sprintf("order-%d", i+1), BuyerID: "buyer", ItemID: "item"})
+		}
+		return &mtop.SoldOrdersPage{NextPage: end < totalOrders, Items: items}, nil
+	}}
+	return NewOrderRuntime(nil, OrderRuntimeHooks{Client: func() mtop.Client { return fake }}, nil, nil)
+}
+
+// TestOrderRuntimePagedFetchRequestsHundredPerPageAndStopsAfterHundred 验证每页索取 100 条且拉满 100 条后一次请求即截断成功。
+func TestOrderRuntimePagedFetchRequestsHundredPerPageAndStopsAfterHundred(t *testing.T) {
+	// calls、gotPageSize 分别统计分页请求次数与最近一次请求的每页条数。
+	calls, gotPageSize := 0, 0
+	// delivered 统计 handler 收到的订单总数。
+	delivered := 0
+	// result、err 保存分页读取的最终状态。
+	result, err := newCappedPagedRuntime(250, 100, &calls, &gotPageSize).FetchSoldOrdersPaged(context.Background(), &orderapp.PlatformRuntimeData{Value: "unb=101"}, func(_ context.Context, page orderapp.RefreshSoldPage) error {
+		delivered += len(page.Orders)
+		return nil
+	})
+	if err != nil || !result.Truncated || calls != 1 || gotPageSize != 100 || delivered != 100 {
+		t.Fatalf("满页截断结果异常: calls=%d pageSize=%d delivered=%d truncated=%v err=%v", calls, gotPageSize, delivered, result.Truncated, err)
+	}
+}
+
+// TestOrderRuntimePagedFetchTruncatesPartialPage 验证平台每页少于 100 条时跨页拉满 100 条，并在末页截断多余订单。
+func TestOrderRuntimePagedFetchTruncatesPartialPage(t *testing.T) {
+	// calls、gotPageSize 分别统计分页请求次数与最近一次请求的每页条数。
+	calls, gotPageSize := 0, 0
+	// pageSizes 保存每页交付的订单数，用于核对末页被截断为 10 条。
+	var pageSizes []int
+	// result、err 保存分页读取的最终状态。
+	result, err := newCappedPagedRuntime(250, 30, &calls, &gotPageSize).FetchSoldOrdersPaged(context.Background(), &orderapp.PlatformRuntimeData{Value: "unb=101"}, func(_ context.Context, page orderapp.RefreshSoldPage) error {
+		pageSizes = append(pageSizes, len(page.Orders))
+		return nil
+	})
+	if err != nil || !result.Truncated || calls != 4 || gotPageSize != 100 || len(pageSizes) != 4 || pageSizes[3] != 10 {
+		t.Fatalf("跨页截断结果异常: calls=%d pageSize=%d pages=%v truncated=%v err=%v", calls, gotPageSize, pageSizes, result.Truncated, err)
+	}
+}
+
+// TestOrderRuntimePagedFetchUnderCapCompletesNormally 验证订单总数不足 100 条时完整拉取且不标记截断。
+func TestOrderRuntimePagedFetchUnderCapCompletesNormally(t *testing.T) {
+	// calls、gotPageSize 分别统计分页请求次数与最近一次请求的每页条数。
+	calls, gotPageSize := 0, 0
+	// delivered 统计 handler 收到的订单总数。
+	delivered := 0
+	// result、err 保存分页读取的最终状态。
+	result, err := newCappedPagedRuntime(60, 30, &calls, &gotPageSize).FetchSoldOrdersPaged(context.Background(), &orderapp.PlatformRuntimeData{Value: "unb=101"}, func(_ context.Context, page orderapp.RefreshSoldPage) error {
+		delivered += len(page.Orders)
+		return nil
+	})
+	if err != nil || result.Truncated || calls != 2 || gotPageSize != 100 || delivered != 60 {
+		t.Fatalf("不足上限应完整拉取: calls=%d pageSize=%d delivered=%d truncated=%v err=%v", calls, gotPageSize, delivered, result.Truncated, err)
+	}
+}

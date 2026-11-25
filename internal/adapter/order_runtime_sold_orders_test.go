@@ -43,10 +43,12 @@ func TestOrderRuntimeSoldPaginationCompleteness(t *testing.T) {
 		wantCount int
 		// wantError 指定错误分类，空值要求正常完成。
 		wantError string
+		// wantTruncated 表示拉取达到最近订单条数上限而提前结束，仍属正常完成。
+		wantTruncated bool
 	}{
 		{name: "complete twelve pages", pages: 12, wantCount: 12},
 		{name: "complete hundredth page", pages: 100, wantCount: 100},
-		{name: "limit still has next", pages: 100, terminal: "next", wantCount: 100, wantError: "100"},
+		{name: "limit still has next", pages: 100, terminal: "next", wantCount: 100, wantTruncated: true},
 		{name: "empty first page", pages: 1, terminal: "empty"},
 		{name: "empty terminal page", pages: 2, terminal: "empty", wantCount: 1},
 		{name: "empty first has next", pages: 1, terminal: "empty-next", wantError: "空页"},
@@ -66,7 +68,7 @@ func TestOrderRuntimeSoldPaginationCompleteness(t *testing.T) {
 			// fake 的 fetch 回调使用 ctx 更新会话、核对 pageNumber/pageSize，忽略扁平凭证参数。
 			fake := &soldRuntimePageFake{orderRuntimeMTopFake: &orderRuntimeMTopFake{}, fetch: func(ctx context.Context, _ string, pageNumber, pageSize int) (*mtop.SoldOrdersPage, error) {
 				calls++
-				if pageNumber != calls || pageSize != 30 || calls > testCase.pages {
+				if pageNumber != calls || pageSize != 100 || calls > testCase.pages {
 					t.Fatal("分页请求顺序、页大小或停止条件错误")
 				}
 				mtop.CookieSessionFromContext(ctx).ReplaceSnapshot([]cookierefresh.BrowserCookie{{Name: "sid", Value: fmt.Sprintf("rotated-%d", calls), Domain: ".goofish.com", Path: "/"}})
@@ -95,6 +97,9 @@ func TestOrderRuntimeSoldPaginationCompleteness(t *testing.T) {
 			}
 			if calls != testCase.pages || len(result.Orders) != testCase.wantCount {
 				t.Fatalf("请求次数=%d，保留订单=%d", calls, len(result.Orders))
+			}
+			if result.Truncated != testCase.wantTruncated {
+				t.Fatalf("截断标记异常: truncated=%v", result.Truncated)
 			}
 			if testCase.terminal == "error" && !errors.Is(err, expectedErr) {
 				t.Fatal("平台错误身份丢失")
@@ -225,5 +230,16 @@ func TestOrderRuntimeSoldIdentityMatchesHTTP(t *testing.T) {
 	result, err := runtime.FetchSoldOrders(context.Background(), &orderapp.PlatformRuntimeData{Value: "sid=initial", MetadataJSON: cookierefresh.MetadataWithSnapshot("", snapshot)})
 	if err != nil || calls != 1 || result.SellerID != "202" || !result.CookieUpdate.Changed || !result.CookieUpdate.Handled {
 		t.Fatal("实际 HTTP 身份、请求结果或响应 Cookie 收集异常")
+	}
+}
+
+// TestOrderRuntimeSoldFetchStopsAfterHundredOrders 验证一次性读取同样在拉满 100 条后截断成功，不累积更早订单。
+func TestOrderRuntimeSoldFetchStopsAfterHundredOrders(t *testing.T) {
+	// calls、gotPageSize 分别统计分页请求次数与最近一次请求的每页条数。
+	calls, gotPageSize := 0, 0
+	// result、err 保存一次性读取的累积结果。
+	result, err := newCappedPagedRuntime(250, 100, &calls, &gotPageSize).FetchSoldOrders(context.Background(), &orderapp.PlatformRuntimeData{Value: "unb=101"})
+	if err != nil || !result.Truncated || calls != 1 || gotPageSize != 100 || len(result.Orders) != 100 {
+		t.Fatalf("一次性读取截断结果异常: calls=%d pageSize=%d orders=%d truncated=%v err=%v", calls, gotPageSize, len(result.Orders), result.Truncated, err)
 	}
 }

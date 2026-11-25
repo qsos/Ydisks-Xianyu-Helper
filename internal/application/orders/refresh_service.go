@@ -75,6 +75,8 @@ type RefreshSoldFetchResult struct {
 	Orders []RefreshSoldOrder
 	// CookieUpdate 是请求期间观察到的 Cookie 会话变化。
 	CookieUpdate RefreshCookieUpdate
+	// Truncated 表示本次订单列表同步因达到最近订单条数上限而提前结束；未拉取的更早订单保留在本地，调用方不得据此清理缺失订单。
+	Truncated bool
 }
 
 // RefreshCookieUpdate 描述平台请求观察到的 Cookie Jar 更新。
@@ -145,6 +147,8 @@ type RefreshSummary struct {
 	NoChange int
 	// Failed 是刷新失败数量。
 	Failed int
+	// Truncated 表示本次同步有账号因达到最近订单条数上限而提前结束；未拉取的更早订单保留在本地。
+	Truncated bool
 }
 
 // RefreshResult 是批量订单刷新应用结果。
@@ -408,6 +412,8 @@ func (s *RefreshService) Refresh(ctx context.Context, userID int64, cookieID, st
 			summary.ListUpdated += updated
 			summary.Restored += discoveryResult.Restored
 			summary.Reassigned += discoveryResult.Reassigned
+			// 任一账号因达到最近订单条数上限而提前结束时，本次同步整体标记为截断并在提示中说明。
+			summary.Truncated = summary.Truncated || discoveryResult.Truncated
 			results = append(results, discoveryResult.Results...)
 			// result 保存当前账号的订单发现结果。
 			result := RefreshOrderResult{CookieID: currentCookieID, Stage: "discover", Success: discoveryErr == nil, Discovered: discovered, Updated: updated}
@@ -449,6 +455,8 @@ type refreshDiscoveryResult struct {
 	NewOrderIDs map[string]struct{}
 	// SoftDeleted 保存本次发现阶段标记删除的订单数量。
 	SoftDeleted int
+	// Truncated 表示本次发现因达到最近订单条数上限而提前结束；未拉取的更早订单保留在本地，本次不清理缺失订单。
+	Truncated bool
 	// SessionExpired 表示本账号平台会话已过期。
 	SessionExpired bool
 }
@@ -492,6 +500,8 @@ func (s *RefreshService) discoverAccount(ctx context.Context, userID int64, cook
 		}
 		return commitErr
 	})
+	// state.result.Truncated 记录本次发现是否因达到最近订单条数上限而提前结束；截断时未拉取的更早订单保留在本地，本次不清理缺失订单。
+	state.result.Truncated = fetchResult.Truncated
 	unlock = s.repository.LockCredentials(cookieID)
 	if ctx.Err() != nil {
 		unlock()
@@ -521,10 +531,10 @@ func (s *RefreshService) discoverAccount(ctx context.Context, userID int64, cook
 		}
 		return state.discovered, state.updated, result, discoveryErr
 	}
-	// writeErr 保存已隔离归属冲突；存在冲突时不得清理缺失订单。
+	// writeErr 保存已隔离归属冲突；存在冲突或本次因达到最近订单条数上限而提前结束时不得清理缺失订单。
 	writeErr := state.blockedErr
-	if writeErr == nil {
-		// deleted、deleteErr 保存完整快照成功处理后的缺失清理结果，有冲突或写入失败时不清理。
+	if writeErr == nil && !fetchResult.Truncated {
+		// deleted、deleteErr 保存完整快照成功处理后的缺失清理结果，有冲突或写入失败时不清理；截断的增量同步不进入该分支。
 		deleted, deleteErr := s.repository.SoftDeleteMissingOrders(ctx, cookieID, state.activeIDs)
 		result.SoftDeleted = deleted
 		if deleteErr != nil {

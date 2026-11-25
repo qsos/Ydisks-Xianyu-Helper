@@ -313,8 +313,9 @@ func (r *OrderRuntime) FetchOrderDetail(ctx context.Context, detail *orderapp.Pl
 	return orderapp.RefreshDetailFetchResult{Detail: &orderapp.RefreshDetail{Quantity: result.Quantity, SpecName: result.SpecName, SpecValue: result.SpecValue, OrderStatus: result.OrderStatus, Amount: result.Amount, UpdatedCookies: result.UpdatedCookies}, CookieUpdate: cookieUpdate}, nil
 }
 
-// FetchSoldOrders 用 r 已装配的客户端按 ctx 取消信号读取 detail 对应账号的全部已售订单。
-// detail 中的明文凭证只用于平台请求；返回值保留已抓订单和 Cookie 更新，只有分页完整结束才返回 nil 错误。
+// FetchSoldOrders 用 r 已装配的客户端按 ctx 取消信号读取 detail 对应账号的最近已售订单，最多 orderRuntimeMaxRecentSoldOrders 条。
+// detail 中的明文凭证只用于平台请求；返回值保留已抓订单和 Cookie 更新，只有分页完整结束或达到最近订单条数上限时才返回 nil 错误。
+// 拉取达到上限而提前结束时返回值标记 Truncated，调用方不得据此清理缺失订单。
 // SellerID 仅声明每页实际请求共同使用的 unb，缺失时为空；身份冲突及中途失败均不得用于落库或软删除。
 func (r *OrderRuntime) FetchSoldOrders(ctx context.Context, detail *orderapp.PlatformRuntimeData) (orderapp.RefreshSoldFetchResult, error) {
 	return r.fetchSoldOrders(ctx, detail, nil)
@@ -330,7 +331,7 @@ func (r *OrderRuntime) FetchSoldOrdersPaged(ctx context.Context, detail *orderap
 	return r.fetchSoldOrders(ctx, detail, onPage)
 }
 
-// fetchSoldOrders 是两种读取方式的共同实现：onPage 为空时累积全部订单返回，否则逐页回调并只返回最终状态。
+// fetchSoldOrders 是两种读取方式的共同实现：onPage 为空时累积最近订单返回，否则逐页回调并只返回最终状态；两种方式都在拉取达到最近订单条数上限时提前结束并标记 Truncated。
 func (r *OrderRuntime) fetchSoldOrders(ctx context.Context, detail *orderapp.PlatformRuntimeData, onPage orderapp.RefreshSoldPageHandler) (orderapp.RefreshSoldFetchResult, error) {
 	// client 固定本次同步的平台客户端，身份检查与分页调用使用同一实例。
 	client := r.mtopClient()
@@ -346,6 +347,8 @@ func (r *OrderRuntime) fetchSoldOrders(ctx context.Context, detail *orderapp.Pla
 	requestCtx, session := withOrderCookieSnapshot(mtop.WithBackgroundPacing(ctx), platformRuntimeDataForOrder(detail))
 	// orders 保存跨分页累积的平台订单；逐页提交模式下保持为空。
 	orders := make([]orderapp.RefreshSoldOrder, 0)
+	// fetchedOrders 是本次同步已取得的最近订单条数；达到上限后停止分页，本次不同步更早订单。
+	fetchedOrders := 0
 	// sellerID 保存已观察到的请求 UID，identityComplete 要求每一页都具备可验证的相同身份。
 	sellerID, identityComplete := "", true
 	// pageNumber 是当前请求的订单列表页码。
@@ -364,7 +367,7 @@ func (r *OrderRuntime) fetchSoldOrders(ctx context.Context, detail *orderapp.Pla
 			sellerID = requestSellerID
 		}
 		// page、callErr 保存当前订单列表页及错误。
-		page, callErr := fetcher.FetchSoldOrdersPage(requestCtx, detail.Value, pageNumber, 30)
+		page, callErr := fetcher.FetchSoldOrdersPage(requestCtx, detail.Value, pageNumber, orderRuntimeSoldOrderPageSize)
 		if callErr != nil {
 			return orderapp.RefreshSoldFetchResult{Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, callErr
 		}
@@ -383,6 +386,16 @@ func (r *OrderRuntime) fetchSoldOrders(ctx context.Context, detail *orderapp.Pla
 		if page.NextPage && len(page.Items) == 0 {
 			return orderapp.RefreshSoldFetchResult{Orders: append(orders, pageOrders...), CookieUpdate: orderCookieUpdate(detail, session)}, fmt.Errorf("订单列表第 %d 页为空页但 nextPage 为真，分页不完整", pageNumber)
 		}
+		// remaining 是本次同步还能拉取的最近订单条数；本页超出部分属于更早订单，本次不同步。
+		remaining := orderRuntimeMaxRecentSoldOrders - fetchedOrders
+		// sliced 表示本页因达到最近订单条数上限而被截断；被截掉的订单本次不同步。
+		sliced := false
+		if len(pageOrders) > remaining {
+			pageOrders = pageOrders[:remaining]
+			sliced = true
+		}
+		// fetchedOrders 累计本次同步已取得的最近订单条数；逐页提交模式下同样计数，决定是否达到上限。
+		fetchedOrders += len(pageOrders)
 		// pageSellerID 只在此前每页身份都完整时才声明，任一页缺失身份后禁止后续页做跨账号归属修复。
 		pageSellerID := sellerID
 		if !identityComplete {
@@ -395,6 +408,10 @@ func (r *OrderRuntime) fetchSoldOrders(ctx context.Context, detail *orderapp.Pla
 			}
 		} else {
 			orders = append(orders, pageOrders...)
+		}
+		// 本页被截断或已拉满最近订单且平台还有后续页时提前结束：属于正常完成而非失败，已提交页保留，调用方不得据此清理缺失订单。
+		if sliced || (page.NextPage && fetchedOrders >= orderRuntimeMaxRecentSoldOrders) {
+			return orderapp.RefreshSoldFetchResult{SellerID: pageSellerID, Orders: orders, CookieUpdate: orderCookieUpdate(detail, session), Truncated: true}, nil
 		}
 		if !page.NextPage {
 			return orderapp.RefreshSoldFetchResult{SellerID: pageSellerID, Orders: orders, CookieUpdate: orderCookieUpdate(detail, session)}, nil
@@ -588,6 +605,12 @@ func (r *OrderRuntime) persistCurrentOrderCookieSession(ctx context.Context, det
 
 // orderRuntimeMaxSoldOrderPages 限制一次订单发现最多请求的平台页数。
 const orderRuntimeMaxSoldOrderPages = 100
+
+// orderRuntimeSoldOrderPageSize 是订单列表同步每次分页请求向平台索取的订单条数；平台接口单页上限为 100，取满可减少分页请求次数。
+const orderRuntimeSoldOrderPageSize = 100
+
+// orderRuntimeMaxRecentSoldOrders 是单次订单列表同步最多拉取的最新订单条数；达到后停止分页，本次不同步更早订单，调用方也不得据此清理缺失订单。
+const orderRuntimeMaxRecentSoldOrders = 100
 
 // 确保订单运行时覆盖手动发货和订单刷新应用层端口。
 var _ orderapp.ManualShipRuntime = (*OrderRuntime)(nil)

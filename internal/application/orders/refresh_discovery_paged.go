@@ -64,13 +64,15 @@ func (s *RefreshService) fetchSoldPaged(ctx context.Context, detail *PlatformRun
 	}
 	// fetched、err 保存一次性读取的全部订单及错误。
 	fetched, err := s.runtime.FetchSoldOrders(ctx, detail)
-	// final 是不再携带订单的最终身份与 Cookie 状态，订单已通过 handler 提交。
-	final := RefreshSoldFetchResult{SellerID: fetched.SellerID, CookieUpdate: fetched.CookieUpdate}
+	// final 是不再携带订单的最终身份与 Cookie 状态，订单已通过 handler 提交；截断标记随最终状态透传，调用方据此跳过缺失清理。
+	final := RefreshSoldFetchResult{SellerID: fetched.SellerID, CookieUpdate: fetched.CookieUpdate, Truncated: fetched.Truncated}
 	if err != nil {
 		return final, err
 	}
+	// page 是以单页形式提交的一次性读取结果；截断标记不随页提交，只保留在最终状态里供调用方跳过缺失清理。
+	page := RefreshSoldPage{SellerID: fetched.SellerID, Orders: fetched.Orders, CookieUpdate: fetched.CookieUpdate}
 	// handlerErr 是单页提交错误，非空时放弃本次发现但保留最终 Cookie 状态。
-	if handlerErr := handler(ctx, RefreshSoldPage(fetched)); handlerErr != nil {
+	if handlerErr := handler(ctx, page); handlerErr != nil {
 		return final, handlerErr
 	}
 	return final, nil

@@ -37,6 +37,10 @@ func finishOrderRefresh(summary RefreshSummary, results []RefreshOrderResult, su
 	if summary.Restored > 0 || summary.Reassigned > 0 {
 		successMessage += fmt.Sprintf("；恢复 %d 个已删除订单，修正 %d 个历史错误归属", summary.Restored, summary.Reassigned)
 	}
+	// 截断的同步只拉取最近订单：提示用户更早订单保留在本地，本次数值 100 与适配层 orderRuntimeMaxRecentSoldOrders 保持一致。
+	if summary.Truncated {
+		successMessage += "；本次仅同步最近 100 条订单，更早订单保留在本地"
+	}
 	return RefreshResult{PartialFailure: summary.Failed > 0, Message: successMessage, Summary: summary, Results: results}
 }
 
