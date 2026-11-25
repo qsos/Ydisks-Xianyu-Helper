@@ -10,11 +10,11 @@ $ErrorActionPreference = 'Stop'
 
 $pfxPassword = $env:WINDOWS_SIGNING_PFX_PASSWORD
 $description = $env:WINDOWS_SIGNING_IDENTITY
-if ([string]::IsNullOrWhiteSpace($pfxPassword)) {
-    throw 'WINDOWS_SIGNING_PFX_PASSWORD 未设置'
-}
-if ([string]::IsNullOrWhiteSpace($description)) {
-    throw 'WINDOWS_SIGNING_IDENTITY 未设置'
+# fork 改动：未配置签名证书时跳过签名，不中断构建；产出的安装包无签名，
+# 安装时 Windows 会提示未知发布者，需手动选择“仍要运行”。
+if ([string]::IsNullOrWhiteSpace($pfxPassword) -or [string]::IsNullOrWhiteSpace($description)) {
+    Write-Warning '未配置 Windows 签名证书，跳过签名（安装包将无签名）'
+    return
 }
 
 $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter 'signtool.exe' -Recurse |
